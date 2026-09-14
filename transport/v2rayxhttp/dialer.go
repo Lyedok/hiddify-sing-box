@@ -63,7 +63,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	if body != nil {
 		method = "POST" // stream-up/one
 	}
-	req, _ := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	req, _ := http.NewRequestWithContext(ctx, method, url, body)
 	req.Header = c.options.GetRequestHeader(url)
 	if method == "POST" && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")

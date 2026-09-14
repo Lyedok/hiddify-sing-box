@@ -127,8 +127,32 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
-	ctx, cancel := context.WithCancel(ctx)
+func (c *Client) DialContext(dialCtx context.Context) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(dialCtx))
+	dialCancelDone := make(chan struct{})
+	stopDialCancel := context.AfterFunc(dialCtx, func() {
+		cancel()
+		close(dialCancelDone)
+	})
+	established := false
+	defer func() {
+		if !established {
+			stopDialCancel()
+			cancel()
+		}
+	}()
+	finishDial := func(conn net.Conn) (net.Conn, error) {
+		if !stopDialCancel() {
+			<-dialCancelDone
+			_ = conn.Close()
+			if err := dialCtx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.Canceled
+		}
+		established = true
+		return conn, nil
+	}
 	options := c.options
 	mode := c.options.Mode
 	sessionIdUuid := uuid.New()
@@ -176,7 +200,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			cleanupDialError()
 			return nil, err
 		}
-		return &conn, nil
+		return finishDial(&conn)
 	} else { // stream-down
 		if xmuxClient2 != nil {
 			xmuxClient2.LeftRequests.Add(-1)
@@ -196,7 +220,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			_ = conn.Close()
 			return nil, err
 		}
-		return &conn, nil
+		return finishDial(&conn)
 	}
 	scMaxEachPostBytes := options.GetNormalizedScMaxEachPostBytes()
 	scMinPostsIntervalMs := options.GetNormalizedScMinPostsIntervalMs()
@@ -264,7 +288,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			}
 		}
 	}()
-	return &conn, nil
+	return finishDial(&conn)
 }
 
 func (c *Client) Close() error {

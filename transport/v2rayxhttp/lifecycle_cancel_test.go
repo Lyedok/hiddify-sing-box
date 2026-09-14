@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"testing"
@@ -23,6 +24,25 @@ type contextBlockingRoundTripper struct {
 func (t *contextBlockingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	t.once.Do(func() { close(t.started) })
 	<-request.Context().Done()
+	return nil, request.Context().Err()
+}
+
+type connectedContextBlockingRoundTripper struct {
+	started chan struct{}
+	stopped chan struct{}
+	once    sync.Once
+}
+
+func (t *connectedContextBlockingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	if trace := httptrace.ContextClientTrace(request.Context()); trace != nil && trace.GotConn != nil {
+		trace.GotConn(httptrace.GotConnInfo{Conn: client})
+	}
+	t.once.Do(func() { close(t.started) })
+	<-request.Context().Done()
+	close(t.stopped)
 	return nil, request.Context().Err()
 }
 
@@ -53,6 +73,32 @@ func TestPostPacketHonorsCancellation(t *testing.T) {
 		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("packet request ignored context cancellation")
+	}
+}
+
+func TestOpenStreamHonorsCancellation(t *testing.T) {
+	transport := &connectedContextBlockingRoundTripper{started: make(chan struct{}), stopped: make(chan struct{})}
+	client := &DefaultDialerClient{
+		options:     &option.V2RayXHTTPBaseOptions{},
+		client:      &http.Client{Transport: transport},
+		httpVersion: "2",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, _, _, err := client.OpenStream(ctx, "https://example.invalid/xhttp", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	select {
+	case <-transport.started:
+	case <-time.After(time.Second):
+		t.Fatal("download request did not start")
+	}
+	cancel()
+	select {
+	case <-transport.stopped:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("download request ignored logical connection cancellation")
 	}
 }
 
@@ -108,6 +154,48 @@ func TestPacketUpCloseCancelsInflightPost(t *testing.T) {
 	case <-probe.stopped:
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("closing packet-up connection did not cancel in-flight POST")
+	}
+}
+
+func TestEstablishedPacketUpSurvivesDialContextCancellation(t *testing.T) {
+	probe := &packetCancelProbeClient{started: make(chan struct{}), stopped: make(chan struct{})}
+	baseURL := url.URL{Scheme: "https", Host: "example.invalid", Path: "/xhttp"}
+	options := &option.V2RayXHTTPOptions{Mode: "packet-up"}
+	client := &Client{
+		ctx:            context.Background(),
+		options:        options,
+		getRequestURL:  func(string) url.URL { return baseURL },
+		getRequestURL2: func(string) url.URL { return baseURL },
+		getHTTPClient:  func() (DialerClient, *XmuxClient) { return probe, nil },
+		getHTTPClient2: func() (DialerClient, *XmuxClient) { return probe, nil },
+	}
+
+	dialCtx, cancelDial := context.WithCancel(context.Background())
+	connection, err := client.DialContext(dialCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = connection.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probe.started:
+	case <-time.After(time.Second):
+		t.Fatal("packet upload did not start")
+	}
+	cancelDial()
+	select {
+	case <-probe.stopped:
+		t.Fatal("established connection inherited cancellation from dial context")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probe.stopped:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("closing established connection did not cancel packet upload")
 	}
 }
 
