@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 
 	common "github.com/sagernet/sing-box/common/xray"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
@@ -30,7 +31,7 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	options     *option.V2RayXHTTPBaseOptions
 	client      *http.Client
-	closed      bool
+	closed      atomic.Bool
 	httpVersion string
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
@@ -38,7 +39,11 @@ type DefaultDialerClient struct {
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed
+	return c.closed.Load()
+}
+
+func (c *DefaultDialerClient) CloseIdleConnections() {
+	c.client.CloseIdleConnections()
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -67,7 +72,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed = true
+				c.closed.Store(true)
 			}
 			gotConn.Close()
 			wrc.Close()
@@ -89,7 +94,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 }
 
 func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body io.Reader, contentLength int64) error {
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), "POST", url, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, body)
 	if err != nil {
 		return err
 	}
@@ -98,7 +103,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed = true
+			c.closed.Store(true)
 			return err
 		}
 		io.Copy(io.Discard, resp.Body)
@@ -116,7 +121,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 			uploadConn = c.uploadRawPool.Get()
 			newConnection := uploadConn == nil
 			if newConnection {
-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
+				newConn, err := c.dialUploadConn(ctx)
 				if err != nil {
 					return err
 				}
@@ -130,7 +135,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed = true
+						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
