@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	common "github.com/sagernet/sing-box/common/xray"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
@@ -109,54 +110,83 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
 	} else {
-		// stringify the entire HTTP/1.1 request so it can be
-		// safely retried. if instead req.Write is called multiple
-		// times, the body is already drained after the first
-		// request
+		// Stringify the entire HTTP/1.1 request so it can be safely retried.
+		// Calling req.Write multiple times would reuse an already drained body.
 		requestBuff := new(bytes.Buffer)
 		common.Must(req.Write(requestBuff))
-		var uploadConn any
-		var h1UploadConn *H1Conn
 		for {
-			uploadConn = c.uploadRawPool.Get()
+			uploadConn := c.uploadRawPool.Get()
 			newConnection := uploadConn == nil
+			var h1UploadConn *H1Conn
 			if newConnection {
 				newConn, err := c.dialUploadConn(ctx)
 				if err != nil {
 					return err
 				}
 				h1UploadConn = NewH1Conn(newConn)
-				uploadConn = h1UploadConn
 			} else {
 				h1UploadConn = uploadConn.(*H1Conn)
+			}
 
-				// TODO: Replace 0 here with a config value later
-				// Or add some other condition for optimization purposes
-				if h1UploadConn.UnreadedResponsesCount > 0 {
-					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
-					if err != nil {
-						c.closed.Store(true)
-						return fmt.Errorf("error while reading response: %s", err.Error())
-					}
-					io.Copy(io.Discard, resp.Body)
-					defer resp.Body.Close()
-					if resp.StatusCode != 200 {
-						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
-					}
+			// Raw HTTP/1.1 connections are outside net/http, so context
+			// cancellation must interrupt both the write and response read.
+			cancelDone := make(chan struct{})
+			stopCancel := context.AfterFunc(ctx, func() {
+				_ = h1UploadConn.SetDeadline(time.Now())
+				close(cancelDone)
+			})
+			clearDeadline := func() {
+				if !stopCancel() {
+					<-cancelDone
 				}
+				_ = h1UploadConn.SetDeadline(time.Time{})
 			}
-			_, err := h1UploadConn.Write(requestBuff.Bytes())
-			// if the write failed, we try another connection from
-			// the pool, until the write on a new connection fails.
-			// failed writes to a pooled connection are normal when
-			// the connection has been closed in the meantime.
-			if err == nil {
-				break
-			} else if newConnection {
-				return err
+
+			_, writeErr := h1UploadConn.Write(requestBuff.Bytes())
+			if writeErr != nil {
+				clearDeadline()
+				_ = h1UploadConn.Close()
+				// A pooled keep-alive connection may have been closed by the
+				// peer while idle. Retry once a newly dialed connection is used.
+				if !newConnection {
+					continue
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return writeErr
 			}
+
+			resp, readErr := http.ReadResponse(h1UploadConn.RespBufReader, req)
+			if readErr != nil {
+				clearDeadline()
+				_ = h1UploadConn.Close()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("error while reading response: %w", readErr)
+			}
+			_, copyErr := io.Copy(io.Discard, resp.Body)
+			closeErr := resp.Body.Close()
+			clearDeadline()
+			if copyErr != nil || closeErr != nil {
+				_ = h1UploadConn.Close()
+				if copyErr != nil {
+					return fmt.Errorf("error while draining response: %w", copyErr)
+				}
+				return fmt.Errorf("error while closing response: %w", closeErr)
+			}
+			if resp.StatusCode != http.StatusOK {
+				_ = h1UploadConn.Close()
+				return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+			}
+			if resp.Close || req.Close {
+				_ = h1UploadConn.Close()
+			} else {
+				c.uploadRawPool.Put(h1UploadConn)
+			}
+			break
 		}
-		c.uploadRawPool.Put(uploadConn)
 	}
 
 	return nil
