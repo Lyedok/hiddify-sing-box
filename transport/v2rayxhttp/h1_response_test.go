@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
-func TestH1PostPacketWaitsForAndDrainsResponse(t *testing.T) {
+func TestH1PostPacketDrainsPreviousResponseBeforeReuse(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 
@@ -33,11 +33,13 @@ func TestH1PostPacketWaitsForAndDrainsResponse(t *testing.T) {
 		},
 	}
 
-	requestRead := make(chan struct{})
-	releaseResponse := make(chan struct{})
+	firstRead := make(chan struct{})
+	secondRead := make(chan struct{})
+	releaseFirstResponse := make(chan struct{})
 	serverDone := make(chan error, 1)
 	go func() {
-		request, err := http.ReadRequest(NewH1Conn(serverConn).RespBufReader)
+		reader := NewH1Conn(serverConn).RespBufReader
+		request, err := http.ReadRequest(reader)
 		if err != nil {
 			serverDone <- err
 			return
@@ -48,40 +50,61 @@ func TestH1PostPacketWaitsForAndDrainsResponse(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		close(requestRead)
-		<-releaseResponse
-		_, err = io.WriteString(serverConn, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nready")
+		close(firstRead)
+		<-releaseFirstResponse
+		if _, err = io.WriteString(serverConn, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nready"); err != nil {
+			serverDone <- err
+			return
+		}
+		request, err = http.ReadRequest(reader)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		_, err = io.Copy(io.Discard, request.Body)
+		_ = request.Body.Close()
+		if err == nil {
+			close(secondRead)
+		}
 		serverDone <- err
 	}()
 
-	result := make(chan error, 1)
-	go func() {
-		result <- client.PostPacket(context.Background(), "http://example.invalid/upload", bytes.NewReader([]byte("payload")), 7)
-	}()
-
-	select {
-	case <-requestRead:
-	case <-time.After(time.Second):
-		t.Fatal("server did not receive the upload")
+	if err := client.PostPacket(context.Background(), "http://example.invalid/upload/0", bytes.NewReader([]byte("first")), 5); err != nil {
+		t.Fatal(err)
 	}
 	select {
-	case err := <-result:
-		t.Fatalf("PostPacket returned before its HTTP response was available: %v", err)
+	case <-firstRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the first upload")
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- client.PostPacket(context.Background(), "http://example.invalid/upload/1", bytes.NewReader([]byte("second")), 6)
+	}()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second upload returned before the previous response: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-
-	close(releaseResponse)
+	close(releaseFirstResponse)
 	select {
-	case err := <-result:
+	case err := <-secondResult:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("PostPacket did not finish after the response")
+		t.Fatal("second upload did not continue after draining the previous response")
+	}
+	select {
+	case <-secondRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the second upload")
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
+	client.uploadRawPool.Close()
 }
 
 func TestH1PostPacketCancellationClosesConnection(t *testing.T) {
@@ -106,16 +129,24 @@ func TestH1PostPacketCancellationClosesConnection(t *testing.T) {
 			close(requestRead)
 		}
 	}()
+	if err := client.PostPacket(context.Background(), "http://example.invalid/upload/0", bytes.NewReader([]byte("first")), 5); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the first upload")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- client.PostPacket(ctx, "http://example.invalid/upload", bytes.NewReader([]byte("payload")), 7)
+		result <- client.PostPacket(ctx, "http://example.invalid/upload/1", bytes.NewReader([]byte("second")), 6)
 	}()
 	select {
-	case <-requestRead:
-	case <-time.After(time.Second):
-		t.Fatal("server did not receive the upload")
+	case err := <-result:
+		t.Fatalf("second upload did not wait for the pending response: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	cancel()
 	select {
@@ -124,7 +155,7 @@ func TestH1PostPacketCancellationClosesConnection(t *testing.T) {
 			t.Fatal("expected cancellation error")
 		}
 	case <-time.After(250 * time.Millisecond):
-		t.Fatal("cancellation did not unblock HTTP/1.1 response read")
+		t.Fatal("cancellation did not unblock pending HTTP/1.1 response read")
 	}
 	if pooled := client.uploadRawPool.Get(); pooled != nil {
 		t.Fatal("cancelled HTTP/1.1 connection was returned to the pool")

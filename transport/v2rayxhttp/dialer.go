@@ -164,8 +164,11 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
 	} else {
-		// Stringify the entire HTTP/1.1 request so it can be safely retried.
-		// Calling req.Write multiple times would reuse an already drained body.
+		// Keep one upload request in flight per raw HTTP/1.1 connection.
+		// Before reusing a pooled connection, fully consume its previous
+		// response; after writing the current request, return immediately so
+		// packet-up startup does not wait for a response that may depend on the
+		// download side making progress.
 		requestBuff := new(bytes.Buffer)
 		common.Must(req.Write(requestBuff))
 		for {
@@ -180,7 +183,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 			}
 
 			// Raw HTTP/1.1 connections are outside net/http, so context
-			// cancellation must interrupt both the write and response read.
+			// cancellation must interrupt both response reads and writes.
 			cancelDone := make(chan struct{})
 			stopCancel := context.AfterFunc(ctx, func() {
 				_ = h1UploadConn.SetDeadline(time.Now())
@@ -191,6 +194,44 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 					<-cancelDone
 				}
 				_ = h1UploadConn.SetDeadline(time.Time{})
+			}
+
+			connectionClosed := false
+			for h1UploadConn.PendingResponses > 0 {
+				resp, readErr := http.ReadResponse(h1UploadConn.RespBufReader, req)
+				if readErr != nil {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return fmt.Errorf("error while reading response: %w", readErr)
+				}
+				h1UploadConn.PendingResponses--
+				_, copyErr := io.Copy(io.Discard, resp.Body)
+				closeErr := resp.Body.Close()
+				if copyErr != nil || closeErr != nil {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					if copyErr != nil {
+						return fmt.Errorf("error while draining response: %w", copyErr)
+					}
+					return fmt.Errorf("error while closing response: %w", closeErr)
+				}
+				if resp.StatusCode != http.StatusOK {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+				}
+				if resp.Close {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					connectionClosed = true
+					break
+				}
+			}
+			if connectionClosed {
+				continue
 			}
 
 			_, writeErr := h1UploadConn.Write(requestBuff.Bytes())
@@ -207,31 +248,9 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 				}
 				return writeErr
 			}
-
-			resp, readErr := http.ReadResponse(h1UploadConn.RespBufReader, req)
-			if readErr != nil {
-				clearDeadline()
-				_ = h1UploadConn.Close()
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return fmt.Errorf("error while reading response: %w", readErr)
-			}
-			_, copyErr := io.Copy(io.Discard, resp.Body)
-			closeErr := resp.Body.Close()
+			h1UploadConn.PendingResponses++
 			clearDeadline()
-			if copyErr != nil || closeErr != nil {
-				_ = h1UploadConn.Close()
-				if copyErr != nil {
-					return fmt.Errorf("error while draining response: %w", copyErr)
-				}
-				return fmt.Errorf("error while closing response: %w", closeErr)
-			}
-			if resp.StatusCode != http.StatusOK {
-				_ = h1UploadConn.Close()
-				return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
-			}
-			if resp.Close || req.Close {
+			if req.Close {
 				_ = h1UploadConn.Close()
 			} else {
 				c.uploadRawPool.Put(h1UploadConn)

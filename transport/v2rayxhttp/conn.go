@@ -70,7 +70,8 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 }
 
 type H1Conn struct {
-	RespBufReader *bufio.Reader
+	PendingResponses int
+	RespBufReader    *bufio.Reader
 	net.Conn
 }
 
