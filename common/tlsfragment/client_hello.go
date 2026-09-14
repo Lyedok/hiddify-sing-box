@@ -51,6 +51,9 @@ func parsePositiveRange(value string, defaultMin, defaultMax int) (int, int, err
 	if err == nil && min < 1 {
 		err = fmt.Errorf("range values must be positive")
 	}
+	if err == nil && max > 65535 {
+		err = fmt.Errorf("range values must fit a TLS record")
+	}
 	return min, max, err
 }
 
@@ -119,6 +122,9 @@ func (c *ClientHelloConn) Write(payload []byte) (int, error) {
 	}
 
 	recordPayload := payload[recordLayerHeaderLen:recordLen]
+	if len(recordPayload) == 0 {
+		return c.Conn.Write(payload)
+	}
 	for offset := 0; offset < len(recordPayload); {
 		fragmentLength := randomBetween(c.config.LengthMin, c.config.LengthMax)
 		end := offset + fragmentLength

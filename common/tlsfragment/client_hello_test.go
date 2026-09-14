@@ -98,7 +98,7 @@ func TestParseClientHelloConfig(t *testing.T) {
 	if config.IntervalMin != 10*time.Millisecond || config.IntervalMax != 20*time.Millisecond {
 		t.Fatalf("unexpected interval range: %+v", config)
 	}
-	for _, invalid := range [][2]string{{"0-10", "1"}, {"a-b", "1"}, {"10", "-1"}} {
+	for _, invalid := range [][2]string{{"0-10", "1"}, {"65536", "1"}, {"a-b", "1"}, {"10", "-1"}} {
 		if _, err = ParseClientHelloConfig(invalid[0], invalid[1]); err == nil {
 			t.Fatalf("accepted invalid ranges %q/%q", invalid[0], invalid[1])
 		}
