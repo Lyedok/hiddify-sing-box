@@ -11,6 +11,9 @@ import (
 )
 
 func TestRealityECDHEKeySupportsMLKEMChromeHello(t *testing.T) {
+	if realityClientVersion != [3]byte{26, 9, 9} {
+		t.Fatalf("unexpected REALITY policy version: %v", realityClientVersion)
+	}
 	standard, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
