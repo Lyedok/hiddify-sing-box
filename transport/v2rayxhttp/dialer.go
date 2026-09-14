@@ -35,7 +35,7 @@ type DefaultDialerClient struct {
 	closed      atomic.Bool
 	httpVersion string
 	// pool of net.Conn, created using dialUploadConn
-	uploadRawPool  *sync.Pool
+	uploadRawPool  *h1ConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
 
@@ -45,6 +45,60 @@ func (c *DefaultDialerClient) IsClosed() bool {
 
 func (c *DefaultDialerClient) CloseIdleConnections() {
 	c.client.CloseIdleConnections()
+	if c.uploadRawPool != nil {
+		c.uploadRawPool.Close()
+	}
+}
+
+const maxIdleH1UploadConnections = 16
+
+type h1ConnPool struct {
+	access      sync.Mutex
+	connections []*H1Conn
+	closed      bool
+	maxIdle     int
+}
+
+func newH1ConnPool() *h1ConnPool {
+	return &h1ConnPool{maxIdle: maxIdleH1UploadConnections}
+}
+
+func (p *h1ConnPool) Get() *H1Conn {
+	p.access.Lock()
+	defer p.access.Unlock()
+	if len(p.connections) == 0 {
+		return nil
+	}
+	last := len(p.connections) - 1
+	conn := p.connections[last]
+	p.connections = p.connections[:last]
+	return conn
+}
+
+func (p *h1ConnPool) Put(conn *H1Conn) {
+	p.access.Lock()
+	if !p.closed && len(p.connections) < p.maxIdle {
+		p.connections = append(p.connections, conn)
+		p.access.Unlock()
+		return
+	}
+	p.access.Unlock()
+	_ = conn.Close()
+}
+
+func (p *h1ConnPool) Close() {
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		return
+	}
+	p.closed = true
+	connections := p.connections
+	p.connections = nil
+	p.access.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -115,17 +169,14 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 		requestBuff := new(bytes.Buffer)
 		common.Must(req.Write(requestBuff))
 		for {
-			uploadConn := c.uploadRawPool.Get()
-			newConnection := uploadConn == nil
-			var h1UploadConn *H1Conn
+			h1UploadConn := c.uploadRawPool.Get()
+			newConnection := h1UploadConn == nil
 			if newConnection {
 				newConn, err := c.dialUploadConn(ctx)
 				if err != nil {
 					return err
 				}
 				h1UploadConn = NewH1Conn(newConn)
-			} else {
-				h1UploadConn = uploadConn.(*H1Conn)
 			}
 
 			// Raw HTTP/1.1 connections are outside net/http, so context

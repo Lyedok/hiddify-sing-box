@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestH1PostPacketWaitsForAndDrainsResponse(t *testing.T) {
 	client := &DefaultDialerClient{
 		options:       &option.V2RayXHTTPBaseOptions{},
 		httpVersion:   "1.1",
-		uploadRawPool: &sync.Pool{},
+		uploadRawPool: newH1ConnPool(),
 		dialUploadConn: func(context.Context) (net.Conn, error) {
 			var conn net.Conn
 			dialOnce.Do(func() { conn = clientConn })
@@ -90,7 +91,7 @@ func TestH1PostPacketCancellationClosesConnection(t *testing.T) {
 	client := &DefaultDialerClient{
 		options:       &option.V2RayXHTTPBaseOptions{},
 		httpVersion:   "1.1",
-		uploadRawPool: &sync.Pool{},
+		uploadRawPool: newH1ConnPool(),
 		dialUploadConn: func(context.Context) (net.Conn, error) {
 			return clientConn, nil
 		},
@@ -127,5 +128,48 @@ func TestH1PostPacketCancellationClosesConnection(t *testing.T) {
 	}
 	if pooled := client.uploadRawPool.Get(); pooled != nil {
 		t.Fatal("cancelled HTTP/1.1 connection was returned to the pool")
+	}
+}
+
+type closeProbeConn struct {
+	closed atomic.Bool
+}
+
+func (c *closeProbeConn) Read([]byte) (int, error)          { return 0, net.ErrClosed }
+func (c *closeProbeConn) Write(payload []byte) (int, error) { return len(payload), nil }
+func (c *closeProbeConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+func (c *closeProbeConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *closeProbeConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *closeProbeConn) SetDeadline(time.Time) error      { return nil }
+func (c *closeProbeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *closeProbeConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestH1PoolOwnsAndClosesIdleConnections(t *testing.T) {
+	pool := &h1ConnPool{maxIdle: 2}
+	first := &closeProbeConn{}
+	second := &closeProbeConn{}
+	overflow := &closeProbeConn{}
+	pool.Put(NewH1Conn(first))
+	pool.Put(NewH1Conn(second))
+	pool.Put(NewH1Conn(overflow))
+	if !overflow.closed.Load() {
+		t.Fatal("connection beyond the idle limit was not closed")
+	}
+	if first.closed.Load() || second.closed.Load() {
+		t.Fatal("connection within the idle limit was closed early")
+	}
+
+	pool.Close()
+	pool.Close()
+	if !first.closed.Load() || !second.closed.Load() {
+		t.Fatal("pool shutdown did not close all idle connections")
+	}
+	afterClose := &closeProbeConn{}
+	pool.Put(NewH1Conn(afterClose))
+	if !afterClose.closed.Load() {
+		t.Fatal("connection returned after pool shutdown was not closed")
 	}
 }
