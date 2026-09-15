@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +41,8 @@ type Client struct {
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
 	getHTTPClient2 func() (DialerClient, *XmuxClient)
+	xmuxManager    *XmuxManager
+	xmuxManager2   *XmuxManager
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
@@ -73,6 +74,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	getRequestURL2 := getRequestURL
 	getHTTPClient2 := getHTTPClient
+	xmuxManager2 := xmuxManager
 	if options.Download != nil {
 		options2 := options.Download
 		dialer2 := dialer
@@ -104,7 +106,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		if options2.Xmux != nil {
 			xmuxOptions2 = *options2.Xmux
 		}
-		xmuxManager2 := NewXmuxManager(xmuxOptions2, func() XmuxConn {
+		xmuxManager2 = NewXmuxManager(xmuxOptions2, func() XmuxConn {
 			return createHTTPClient(dest2, dialer2, &options2.V2RayXHTTPBaseOptions, tlsConfig2)
 		})
 		getHTTPClient2 = func() (DialerClient, *XmuxClient) {
@@ -119,10 +121,37 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		getHTTPClient2: getHTTPClient2,
 		getRequestURL:  getRequestURL,
 		getRequestURL2: getRequestURL2,
+		xmuxManager:    xmuxManager,
+		xmuxManager2:   xmuxManager2,
 	}, nil
 }
 
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+func (c *Client) DialContext(dialCtx context.Context) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(dialCtx))
+	dialCancelDone := make(chan struct{})
+	stopDialCancel := context.AfterFunc(dialCtx, func() {
+		cancel()
+		close(dialCancelDone)
+	})
+	established := false
+	defer func() {
+		if !established {
+			stopDialCancel()
+			cancel()
+		}
+	}()
+	finishDial := func(conn net.Conn) (net.Conn, error) {
+		if !stopDialCancel() {
+			<-dialCancelDone
+			_ = conn.Close()
+			if err := dialCtx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.Canceled
+		}
+		established = true
+		return conn, nil
+	}
 	options := c.options
 	mode := c.options.Mode
 	sessionIdUuid := uuid.New()
@@ -140,6 +169,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	reader, writer := io.Pipe()
 	conn := splitConn{
 		writer: writer,
+		cancel: cancel,
 		onClose: func() {
 			if closed.Add(1) > 1 {
 				return
@@ -152,6 +182,12 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			}
 		},
 	}
+	cleanupDialError := func() {
+		cancel()
+		_ = writer.Close()
+		_ = reader.Close()
+		conn.onClose()
+	}
 	var err error
 	if mode == "stream-one" {
 		requestURL.Path = options.GetNormalizedPath()
@@ -160,15 +196,17 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), reader, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
-		return &conn, nil
+		return finishDial(&conn)
 	} else { // stream-down
 		if xmuxClient2 != nil {
 			xmuxClient2.LeftRequests.Add(-1)
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), nil, false)
 		if err != nil { // browser dialer only
+			cleanupDialError()
 			return nil, err
 		}
 	}
@@ -178,9 +216,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		}
 		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), reader, true)
 		if err != nil { // browser dialer only
+			_ = conn.Close()
 			return nil, err
 		}
-		return &conn, nil
+		return finishDial(&conn)
 	}
 	scMaxEachPostBytes := options.GetNormalizedScMaxEachPostBytes()
 	scMinPostsIntervalMs := options.GetNormalizedScMinPostsIntervalMs()
@@ -248,10 +287,16 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			}
 		}
 	}()
-	return &conn, nil
+	return finishDial(&conn)
 }
 
 func (c *Client) Close() error {
+	if c.xmuxManager != nil {
+		c.xmuxManager.Close()
+	}
+	if c.xmuxManager2 != nil && c.xmuxManager2 != c.xmuxManager {
+		c.xmuxManager2.Close()
+	}
 	return nil
 }
 
@@ -367,7 +412,7 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 			Transport: transport,
 		},
 		httpVersion:    httpVersion,
-		uploadRawPool:  &sync.Pool{},
+		uploadRawPool:  newH1ConnPool(),
 		dialUploadConn: dialContext,
 	}
 	return client

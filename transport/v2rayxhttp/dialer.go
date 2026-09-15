@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	common "github.com/sagernet/sing-box/common/xray"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
@@ -30,15 +32,73 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	options     *option.V2RayXHTTPBaseOptions
 	client      *http.Client
-	closed      bool
+	closed      atomic.Bool
 	httpVersion string
 	// pool of net.Conn, created using dialUploadConn
-	uploadRawPool  *sync.Pool
+	uploadRawPool  *h1ConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed
+	return c.closed.Load()
+}
+
+func (c *DefaultDialerClient) CloseIdleConnections() {
+	c.client.CloseIdleConnections()
+	if c.uploadRawPool != nil {
+		c.uploadRawPool.Close()
+	}
+}
+
+const maxIdleH1UploadConnections = 16
+
+type h1ConnPool struct {
+	access      sync.Mutex
+	connections []*H1Conn
+	closed      bool
+	maxIdle     int
+}
+
+func newH1ConnPool() *h1ConnPool {
+	return &h1ConnPool{maxIdle: maxIdleH1UploadConnections}
+}
+
+func (p *h1ConnPool) Get() *H1Conn {
+	p.access.Lock()
+	defer p.access.Unlock()
+	if len(p.connections) == 0 {
+		return nil
+	}
+	last := len(p.connections) - 1
+	conn := p.connections[last]
+	p.connections = p.connections[:last]
+	return conn
+}
+
+func (p *h1ConnPool) Put(conn *H1Conn) {
+	p.access.Lock()
+	if !p.closed && len(p.connections) < p.maxIdle {
+		p.connections = append(p.connections, conn)
+		p.access.Unlock()
+		return
+	}
+	p.access.Unlock()
+	_ = conn.Close()
+}
+
+func (p *h1ConnPool) Close() {
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		return
+	}
+	p.closed = true
+	connections := p.connections
+	p.connections = nil
+	p.access.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -57,7 +117,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	if body != nil {
 		method = "POST" // stream-up/one
 	}
-	req, _ := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	req, _ := http.NewRequestWithContext(ctx, method, url, body)
 	req.Header = c.options.GetRequestHeader(url)
 	if method == "POST" && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")
@@ -67,7 +127,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed = true
+				c.closed.Store(true)
 			}
 			gotConn.Close()
 			wrc.Close()
@@ -89,7 +149,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 }
 
 func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body io.Reader, contentLength int64) error {
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), "POST", url, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, body)
 	if err != nil {
 		return err
 	}
@@ -98,60 +158,105 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed = true
+			c.closed.Store(true)
 			return err
 		}
 		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
 	} else {
-		// stringify the entire HTTP/1.1 request so it can be
-		// safely retried. if instead req.Write is called multiple
-		// times, the body is already drained after the first
-		// request
+		// Keep one upload request in flight per raw HTTP/1.1 connection.
+		// Before reusing a pooled connection, fully consume its previous
+		// response; after writing the current request, return immediately so
+		// packet-up startup does not wait for a response that may depend on the
+		// download side making progress.
 		requestBuff := new(bytes.Buffer)
 		common.Must(req.Write(requestBuff))
-		var uploadConn any
-		var h1UploadConn *H1Conn
 		for {
-			uploadConn = c.uploadRawPool.Get()
-			newConnection := uploadConn == nil
+			h1UploadConn := c.uploadRawPool.Get()
+			newConnection := h1UploadConn == nil
 			if newConnection {
-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
+				newConn, err := c.dialUploadConn(ctx)
 				if err != nil {
 					return err
 				}
 				h1UploadConn = NewH1Conn(newConn)
-				uploadConn = h1UploadConn
-			} else {
-				h1UploadConn = uploadConn.(*H1Conn)
+			}
 
-				// TODO: Replace 0 here with a config value later
-				// Or add some other condition for optimization purposes
-				if h1UploadConn.UnreadedResponsesCount > 0 {
-					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
-					if err != nil {
-						c.closed = true
-						return fmt.Errorf("error while reading response: %s", err.Error())
+			// Raw HTTP/1.1 connections are outside net/http, so context
+			// cancellation must interrupt both response reads and writes.
+			cancelDone := make(chan struct{})
+			stopCancel := context.AfterFunc(ctx, func() {
+				_ = h1UploadConn.SetDeadline(time.Now())
+				close(cancelDone)
+			})
+			clearDeadline := func() {
+				if !stopCancel() {
+					<-cancelDone
+				}
+				_ = h1UploadConn.SetDeadline(time.Time{})
+			}
+
+			connectionClosed := false
+			for h1UploadConn.PendingResponses > 0 {
+				resp, readErr := http.ReadResponse(h1UploadConn.RespBufReader, req)
+				if readErr != nil {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					if ctx.Err() != nil {
+						return ctx.Err()
 					}
-					io.Copy(io.Discard, resp.Body)
-					defer resp.Body.Close()
-					if resp.StatusCode != 200 {
-						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+					return fmt.Errorf("error while reading response: %w", readErr)
+				}
+				h1UploadConn.PendingResponses--
+				_, copyErr := io.Copy(io.Discard, resp.Body)
+				closeErr := resp.Body.Close()
+				if copyErr != nil || closeErr != nil {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					if copyErr != nil {
+						return fmt.Errorf("error while draining response: %w", copyErr)
 					}
+					return fmt.Errorf("error while closing response: %w", closeErr)
+				}
+				if resp.StatusCode != http.StatusOK {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+				}
+				if resp.Close {
+					clearDeadline()
+					_ = h1UploadConn.Close()
+					connectionClosed = true
+					break
 				}
 			}
-			_, err := h1UploadConn.Write(requestBuff.Bytes())
-			// if the write failed, we try another connection from
-			// the pool, until the write on a new connection fails.
-			// failed writes to a pooled connection are normal when
-			// the connection has been closed in the meantime.
-			if err == nil {
-				break
-			} else if newConnection {
-				return err
+			if connectionClosed {
+				continue
 			}
+
+			_, writeErr := h1UploadConn.Write(requestBuff.Bytes())
+			if writeErr != nil {
+				clearDeadline()
+				_ = h1UploadConn.Close()
+				// A pooled keep-alive connection may have been closed by the
+				// peer while idle. Retry once a newly dialed connection is used.
+				if !newConnection {
+					continue
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return writeErr
+			}
+			h1UploadConn.PendingResponses++
+			clearDeadline()
+			if req.Close {
+				_ = h1UploadConn.Close()
+			} else {
+				c.uploadRawPool.Put(h1UploadConn)
+			}
+			break
 		}
-		c.uploadRawPool.Put(uploadConn)
 	}
 
 	return nil

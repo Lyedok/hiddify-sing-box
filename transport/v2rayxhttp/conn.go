@@ -2,6 +2,7 @@ package xhttp
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -16,7 +17,9 @@ type splitConn struct {
 	reader     io.ReadCloser
 	remoteAddr net.Addr
 	localAddr  net.Addr
+	cancel     context.CancelFunc
 	onClose    func()
+	closeOnce  sync.Once
 }
 
 func (c *splitConn) Write(b []byte) (int, error) {
@@ -27,22 +30,20 @@ func (c *splitConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-func (c *splitConn) Close() error {
-	if c.onClose != nil {
-		c.onClose()
-	}
-
-	err := c.writer.Close()
-	err2 := c.reader.Close()
-	if err != nil {
-		return err
-	}
-
-	if err2 != nil {
-		return err
-	}
-
-	return nil
+func (c *splitConn) Close() (err error) {
+	c.closeOnce.Do(func() {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		if c.onClose != nil {
+			c.onClose()
+		}
+		err = c.writer.Close()
+		if readerErr := c.reader.Close(); err == nil {
+			err = readerErr
+		}
+	})
+	return
 }
 
 func (c *splitConn) LocalAddr() net.Addr {
@@ -69,8 +70,8 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 }
 
 type H1Conn struct {
-	UnreadedResponsesCount int
-	RespBufReader          *bufio.Reader
+	PendingResponses int
+	RespBufReader    *bufio.Reader
 	net.Conn
 }
 

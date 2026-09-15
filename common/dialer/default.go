@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/conntrack"
 	"github.com/sagernet/sing-box/common/listener"
+	tf "github.com/sagernet/sing-box/common/tlsfragment"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -44,11 +46,27 @@ type DefaultDialer struct {
 	fallbackNetworkType    []C.InterfaceType
 	networkFallbackDelay   time.Duration
 	networkLastFallback    common.TypedValue[time.Time]
+	tlsFragment            *tf.ClientHelloConfig
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	var tlsFragment *tf.ClientHelloConfig
+	if options.TLSFragment.Enabled {
+		method := strings.ToLower(options.TLSFragment.Method)
+		if method != "" && method != "tlshello" {
+			return nil, E.New("unsupported outbound TLS fragment method: ", options.TLSFragment.Method)
+		}
+		fragmentConfig, err := tf.ParseClientHelloConfig(options.TLSFragment.Size, options.TLSFragment.Sleep)
+		if err != nil {
+			return nil, err
+		}
+		tlsFragment = &fragmentConfig
+		// TCP Fast Open can send the ClientHello before the returned connection
+		// is wrapped, bypassing fragmentation.
+		options.TCPFastOpen = false
+	}
 
 	var (
 		dialer                 net.Dialer
@@ -212,6 +230,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		networkType:            networkType,
 		fallbackNetworkType:    fallbackNetworkType,
 		networkFallbackDelay:   networkFallbackDelay,
+		tlsFragment:            tlsFragment,
 	}, nil
 }
 
@@ -238,7 +257,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		return nil, E.New("domain not resolved")
 	}
 	if d.networkStrategy == nil {
-		return trackConn(listener.ListenNetworkNamespace[net.Conn](d.netns, func() (net.Conn, error) {
+		conn, err := listener.ListenNetworkNamespace[net.Conn](d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
@@ -252,7 +271,11 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 			} else {
 				return DialSlowContext(&d.dialer6, ctx, network, address)
 			}
-		}))
+		})
+		if err != nil {
+			return nil, err
+		}
+		return trackConn(d.wrapTLSFragment(ctx, network, conn), nil)
 	} else {
 		return d.DialParallelInterface(ctx, network, address, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
 	}
@@ -303,7 +326,14 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	if !fastFallback && !isPrimary {
 		d.networkLastFallback.Store(time.Now())
 	}
-	return trackConn(conn, nil)
+	return trackConn(d.wrapTLSFragment(ctx, network, conn), nil)
+}
+
+func (d *DefaultDialer) wrapTLSFragment(ctx context.Context, network string, conn net.Conn) net.Conn {
+	if d.tlsFragment == nil || N.NetworkName(network) != N.NetworkTCP {
+		return conn
+	}
+	return tf.NewClientHelloConn(conn, ctx, *d.tlsFragment)
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

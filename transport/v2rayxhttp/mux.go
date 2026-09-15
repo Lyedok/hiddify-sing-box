@@ -72,6 +72,7 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient {
 			xmuxClient.LeftRequests.Load() <= 0 ||
 			(xmuxClient.UnreusableAt != time.Time{} && time.Now().After(xmuxClient.UnreusableAt)) {
 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+			closeIdleConnections(xmuxClient.XmuxConn)
 		} else {
 			i++
 		}
@@ -101,4 +102,19 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient {
 		xmuxClient.leftUsage -= 1
 	}
 	return xmuxClient
+}
+
+func (m *XmuxManager) Close() {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	for _, xmuxClient := range m.xmuxClients {
+		closeIdleConnections(xmuxClient.XmuxConn)
+	}
+	m.xmuxClients = nil
+}
+
+func closeIdleConnections(conn XmuxConn) {
+	if closer, ok := conn.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
